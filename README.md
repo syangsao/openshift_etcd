@@ -604,13 +604,13 @@ oc get cronjob -n openshift-etcd
 
 ## Known Issues & Lessons Learned (luke cluster testing, 2026-10-05)
 
-### Issue: Kubelet Fails to Start etcd Static Pod After Restore
+### Issue: Kubelet Fails to Start etcd Static Pod After Restore (OCP 4.22)
 
 **Symptom**: After running `cluster-restore.sh` on the recovery host, the kubelet does not start the `restore-etcd` static pod. The API server remains unresponsive indefinitely.
 
 **Root cause**: On OpenShift 4.22 (Kubernetes v1.35), the etcd static pod manifest uses projected volumes (secrets/configmaps) that require the API server to be running. This creates a chicken-and-egg problem: the kubelet cannot start the etcd pod without the API, and the API cannot start without etcd.
 
-**Workaround**: Use the `ETCD_ETCDCTL_RESTORE=1` environment variable when running `cluster-restore.sh`. This mode uses `etcdctl snapshot restore` directly instead of creating a restore-etcd static pod:
+**Workaround 1 — ETCD_ETCDCTL_RESTORE mode**: Use the `ETCD_ETCDCTL_RESTORE=1` environment variable when running `cluster-restore.sh`. This mode uses `etcdctl snapshot restore` directly instead of creating a restore-etcd static pod:
 
 ```bash
 ETCD_ETCDCTL_RESTORE=1 sudo -E /usr/local/bin/cluster-restore.sh /home/core/assets/backup
@@ -618,38 +618,83 @@ ETCD_ETCDCTL_RESTORE=1 sudo -E /usr/local/bin/cluster-restore.sh /home/core/asse
 
 This bypasses the static pod mechanism entirely and restores the snapshot data directly. However, the kubelet still needs to start the original etcd-pod.yaml, which may also hit the same chicken-and-egg problem.
 
-**Additional workaround**: If the kubelet is stuck, manually start the etcd container using `podman` with host networking and SELinux shared labels:
+**Workaround 2 — Manual podman start (verified working on luke cluster)**: If the kubelet is stuck, manually start the etcd container using `podman` with host networking and SELinux shared labels. This was verified to restore API access:
 
 ```bash
+# Run as root on the recovery node
+ETCD_IMAGE="quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:89e0f7620b82da448889c76bc3c49cbd6c456fe77c8ae41693b0b24169658670"
+NODE_IP=$(hostname -I | awk '{print $1}')
+ETCD_NAME=$(hostname)
+HOST_CERTS="/etc/kubernetes/static-pod-resources/etcd-certs"
+CONTAINER_CERTS="/etc/kubernetes/static-pod-certs"
+
+# Step 1: Restore the snapshot data (if not already done by cluster-restore.sh)
+mkdir -p /tmp/snap
+cp /home/core/assets/backup/snapshot_*.db /tmp/snap/snapshot.db
+rm -rf /var/lib/etcd && mkdir -p /var/lib/etcd
+podman run --rm \
+  -v /tmp/snap:/snap:ro,z \
+  -v /var/lib/etcd:/var/lib/etcd:z \
+  --entrypoint /usr/bin/etcdutl \
+  "$ETCD_IMAGE" \
+  snapshot restore /snap/snapshot.db \
+    --name="$ETCD_NAME" \
+    --initial-cluster="$ETCD_NAME=https://${NODE_IP}:2380" \
+    --initial-cluster-token=openshift-etcd-restore \
+    --initial-advertise-peer-urls="https://${NODE_IP}:2380" \
+    --data-dir=/var/lib/etcd \
+    --skip-hash-check=true
+
+# Step 2: Start etcd with host networking and SELinux :z labels
 podman run -d \
   --name etcd-manual \
   --network=host \
   -v /var/lib/etcd:/var/lib/etcd:z \
-  -v /etc/kubernetes/static-pod-resources/etcd-certs:/etc/kubernetes/static-pod-resources/etcd-certs:ro,z \
-  --entrypoint /usr/bin/etcd \
-  <etcd_image> \
-    --name="<ETCD_NAME>" \
-    --data-dir=/var/lib/etcd \
-    --initial-advertise-peer-urls="https://<NODE_IP>:2380" \
-    --listen-peer-urls="https://<NODE_IP>:2380" \
-    --advertise-client-urls="https://<NODE_IP>:2379" \
-    --listen-client-urls="https://127.0.0.1:2379,https://<NODE_IP>:2379" \
-    --initial-cluster="<ETCD_NAME>=https://<NODE_IP>:2380" \
+  -v "${HOST_CERTS}":"${CONTAINER_CERTS}":ro,z \
+  --entrypoint /bin/sh \
+  "$ETCD_IMAGE" \
+  -c "exec etcd \
+    --logger=zap \
+    --log-level=info \
+    --initial-advertise-peer-urls=https://${NODE_IP}:2380 \
+    --listen-peer-urls=https://${NODE_IP}:2380 \
+    --advertise-client-urls=https://${NODE_IP}:2379 \
+    --listen-client-urls=https://127.0.0.1:2379,https://${NODE_IP}:2379 \
+    --initial-cluster=${ETCD_NAME}=https://${NODE_IP}:2380 \
     --initial-cluster-state=new \
-    --cert-file=<serving_cert> \
-    --key-file=<serving_key> \
-    --peer-cert-file=<peer_cert> \
-    --peer-key-file=<peer_key> \
+    --data-dir=/var/lib/etcd \
+    --cert-file=${CONTAINER_CERTS}/secrets/etcd-all-certs/etcd-serving-${ETCD_NAME}.crt \
+    --key-file=${CONTAINER_CERTS}/secrets/etcd-all-certs/etcd-serving-${ETCD_NAME}.key \
+    --trusted-ca-file=${CONTAINER_CERTS}/configmaps/etcd-all-bundles/server-ca-bundle.crt \
     --client-cert-auth=true \
-    --peer-client-cert-auth=true \
-    --trusted-ca-file=<server_ca_bundle> \
-    --peer-trusted-ca-file=<server_ca_bundle>
+    --peer-cert-file=${CONTAINER_CERTS}/secrets/etcd-all-certs/etcd-peer-${ETCD_NAME}.crt \
+    --peer-key-file=${CONTAINER_CERTS}/secrets/etcd-all-certs/etcd-peer-${ETCD_NAME}.key \
+    --peer-trusted-ca-file=${CONTAINER_CERTS}/configmaps/etcd-all-bundles/server-ca-bundle.crt \
+    --peer-client-cert-auth=true"
+
+# Step 3: Verify etcd is healthy
+podman exec etcd-manual etcdctl endpoint health \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=${CONTAINER_CERTS}/configmaps/etcd-all-bundles/server-ca-bundle.crt \
+  --cert=${CONTAINER_CERTS}/secrets/etcd-all-certs/etcd-serving-${ETCD_NAME}.crt \
+  --key=${CONTAINER_CERTS}/secrets/etcd-all-certs/etcd-serving-${ETCD_NAME}.key
 ```
 
-Where `<etcd_image>` can be found from the etcd-pod.yaml:
-```bash
-python3 -c "import json; pod=json.load(open('/etc/kubernetes/manifests/etcd-pod.yaml')); print([c['image'] for c in pod['spec']['containers'] if c['name']=='etcd'][0])"
-```
+**Key findings from manual recovery (2026-10-05)**:
+
+1. **SELinux is the critical blocker**: The cert files have `kubernetes_file_t` SELinux context. Without the `:z` flag on the podman volume mount, etcd gets `permission denied` when reading certs. The `:z` flag relabels the files to a shared container context.
+
+2. **Host networking is required**: The etcd process needs to bind to the node's IP address (e.g., `192.168.40.26:2380`). Without `--network=host`, the container can't assign that address and fails with `bind: cannot assign requested address`.
+
+3. **Cert path mapping**: On the host, certs are at `/etc/kubernetes/static-pod-resources/etcd-certs/`. Inside the etcd container, they appear at `/etc/kubernetes/static-pod-certs/`. The podman mount must map host path to container path.
+
+4. **`initial-cluster-state=new`** creates a fresh single-member cluster. This is correct for recovery from a snapshot restore. The etcd operator will scale up additional members once it detects the healthy single member.
+
+5. **Do NOT remove the manual podman container** until the kubelet-managed etcd pod has started and taken over. Removing it releases ports 2379/2380, and if the kubelet hasn't started its own etcd pod yet, the API goes down again.
+
+6. **The kubelet eventually starts the etcd static pod** on its own after ~15-20 minutes of retrying. The manual podman container is a bridge to get the API up faster. Once the kubelet-managed pod is running (check with `crictl ps | grep etcd`), the manual container can be safely removed.
+
+7. **Independently restored snapshots on non-recovery nodes cause cluster ID mismatches**. If you restore the same snapshot on multiple nodes using `etcdutl snapshot restore` with different `--initial-cluster` values, each node gets a different cluster ID and they cannot form a cluster together. The correct approach is to let the etcd operator add members to the existing cluster, not to independently restore on each node.
 
 ### Issue: SSH Host Key Changes After Node Reboot
 
@@ -670,6 +715,16 @@ ssh core@<node_name>  # Re-add the new host key
 ssh core@<node> 'sudo cat /home/core/assets/backup/snapshot_*.db' > ~/local/backup.db
 ```
 
+### Current Cluster State (luke, 2026-10-05 post-recovery)
+
+After the restore test and recovery, the luke cluster is in a **functional but degraded** state:
+
+- API: **Up** (all nodes Ready, operators Available)
+- etcd: **Single member** (control01 only) — reduced redundancy
+- control02/arbiter etcd pods: **Not running** (independently restored data has mismatched cluster IDs)
+- The etcd operator is stuck at `CheckSafeToScaleCluster found 1 healthy member(s) out of the 3 required`
+
+**To fully recover 3-member etcd**, a proper `cluster-restore.sh` run is needed (which handles member scaling correctly), or the independently restored data on control02/arbiter must be wiped and the operator must re-add them as fresh members.
 ---
 
 ## Quick Reference
