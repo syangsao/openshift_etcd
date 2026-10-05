@@ -715,16 +715,55 @@ ssh core@<node_name>  # Re-add the new host key
 ssh core@<node> 'sudo cat /home/core/assets/backup/snapshot_*.db' > ~/local/backup.db
 ```
 
-### Current Cluster State (luke, 2026-10-05 post-recovery)
+### Recovering a Degraded Single-Member etcd Cluster (verified working, 2026-10-05)
 
-After the restore test and recovery, the luke cluster is in a **functional but degraded** state:
+After the restore test left the luke cluster with a single-member etcd (control01 only), the following procedure was used to recover all 3 members:
 
-- API: **Up** (all nodes Ready, operators Available)
-- etcd: **Single member** (control01 only) — reduced redundancy
-- control02/arbiter etcd pods: **Not running** (independently restored data has mismatched cluster IDs)
-- The etcd operator is stuck at `CheckSafeToScaleCluster found 1 healthy member(s) out of the 3 required`
+**Step 1**: Wipe stale `/var/lib/etcd` data on the non-recovery nodes (if they have independently restored data with mismatched cluster IDs):
+```bash
+# On control02 and arbiter:
+sudo rm -rf /var/lib/etcd && sudo mkdir -p /var/lib/etcd
+```
 
-**To fully recover 3-member etcd**, a proper `cluster-restore.sh` run is needed (which handles member scaling correctly), or the independently restored data on control02/arbiter must be wiped and the operator must re-add them as fresh members.
+**Step 2**: Restore the `etcd-pod.yaml` static pod manifest to `/etc/kubernetes/manifests/` on both nodes (if it was removed during the restore process):
+```bash
+# The manifest is typically backed up in /home/core/assets/manifests-stopped/
+sudo cp /home/core/assets/manifests-stopped/etcd-pod.yaml /etc/kubernetes/manifests/
+```
+
+**Step 3**: Wait for the kubelet to start the etcd containers. The etcd process will detect the live cluster and match the cluster ID, then wait to be added as a member:
+```bash
+# Verify the etcd container is running and waiting:
+sudo crictl ps | grep etcd
+sudo crictl logs <etcd_container_id> | tail -5
+# Expected output: "Live Cluster ID: [xxx], local: [xxx] ... member not found in member list"
+```
+
+**Step 4**: Manually add the missing members using `etcdctl` from the healthy node:
+```bash
+# From control01 (the healthy member), add each missing member:
+oc exec -n openshift-etcd etcd-control01.syangsao.net -c etcd -- env -i \
+  ETCDCTL_API=3 /usr/bin/etcdctl member add control02.syangsao.net \
+    --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/kubernetes/static-pod-certs/configmaps/etcd-all-bundles/server-ca-bundle.crt \
+    --cert=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-serving-control01.syangsao.net.crt \
+    --key=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-serving-control01.syangsao.net.key \
+    --peer-urls=https://<CONTROL02_IP>:2380
+
+# Repeat for arbiter with its IP
+```
+
+**Step 5**: Verify all members are healthy:
+```bash
+oc exec -n openshift-etcd etcd-control01.syangsao.net -c etcd -- env -i \
+  ETCDCTL_API=3 /usr/bin/etcdctl endpoint health \
+    --endpoints=https://127.0.0.1:2379,https://<IP1>:2379,https://<IP2>:2379 \
+    --cacert=/etc/kubernetes/static-pod-certs/configmaps/etcd-all-bundles/server-ca-bundle.crt \
+    --cert=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-serving-control01.syangsao.net.crt \
+    --key=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-serving-control01.syangsao.net.key
+```
+
+**Result**: All 3 etcd members healthy, cluster fully recovered. The etcd operator may still show DEGRADED if the static pod objects aren't registered in the API, but the data plane is fully functional with quorum restored.
 ---
 
 ## Quick Reference
