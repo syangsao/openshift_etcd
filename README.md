@@ -717,7 +717,7 @@ ssh core@<node> 'sudo cat /home/core/assets/backup/snapshot_*.db' > ~/local/back
 
 ### Recovering a Degraded Single-Member etcd Cluster (verified working, 2026-10-05)
 
-After the restore test left the luke cluster with a single-member etcd (control01 only), the following procedure was used to recover all 3 members:
+After the restore test left the luke cluster with a single-member etcd (control01 only), the following procedure was used to recover all 3 members and clear the etcd operator's DEGRADED status:
 
 **Step 1**: Wipe stale `/var/lib/etcd` data on the non-recovery nodes (if they have independently restored data with mismatched cluster IDs):
 ```bash
@@ -763,8 +763,36 @@ oc exec -n openshift-etcd etcd-control01.syangsao.net -c etcd -- env -i \
     --key=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-serving-control01.syangsao.net.key
 ```
 
-**Result**: All 3 etcd members healthy, cluster fully recovered. The etcd operator may still show DEGRADED if the static pod objects aren't registered in the API, but the data plane is fully functional with quorum restored.
----
+**Step 6**: Fix the etcd operator's DEGRADED status (static pod registration):
+
+After steps 1-5, the etcd data plane is healthy (3/3 members) but the operator may still show `DEGRADED=True` with errors like:
+- `GuardControllerDegraded: [Missing operand on node <node>]`
+- `MissingStaticPodControllerDegraded: static pod "etcd" ... didn't show up, waited: 3m0s`
+
+This happens because the kubelet started the etcd containers locally but failed to register the pod objects in the API. The fix is to **restart the kubelet** on the affected nodes to force a clean static pod registration cycle:
+```bash
+# On each node where the etcd pod isn't registered in the API:
+sudo systemctl restart kubelet
+```
+
+After the kubelet restarts, it re-processes the static pod manifests and creates the pod objects in the API. The operator then detects the pods and clears the DEGRADED status.
+
+> **Warning**: Do NOT use `oc patch etcd cluster` with `forceRedeploymentReason` to fix this. On a single-member or degraded cluster, the force redeployment can trigger the operator to restart etcd on the only healthy node, taking down the API entirely. The kubelet restart is safe because it doesn't touch the running etcd process — it just re-registers the pod object.
+
+**Step 7**: Verify final state:
+```bash
+# All 3 etcd pods should be registered and running:
+oc get pods -n openshift-etcd -l k8s-app=etcd
+# Expected:
+#   etcd-control01.syangsao.net   5/5   Running
+#   etcd-control02.syangsao.net   5/5   Running
+#   etcd-arbiter.syangsao.net     5/5   Running
+
+# Operator should show DEGRADED=False:
+oc get co etcd
+```
+
+**Result** (verified on luke cluster, 2026-10-05): All 3 etcd members healthy (~9ms), all pods registered in API, etcd operator DEGRADED=False. The operator showed PROGRESSING=True as it rolled out a new etcd revision — this is normal post-recovery behavior and completes on its own.
 
 ## Quick Reference
 
